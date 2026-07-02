@@ -9,13 +9,11 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-
-from agent.agent import run_extraction
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -227,7 +225,7 @@ def _clean(text: str) -> str:
 # Core scrape function
 # ---------------------------------------------------------------------------
 
-async def scrape_url(url: str, client: httpx.AsyncClient) -> ScrapedResult | ErrorResult:
+async def scrape_url(url: str, client: httpx.AsyncClient) -> Union[ScrapedResult, ErrorResult]:
     """Scrape a single URL and extract product/licence fields."""
     # Basic URL validation
     try:
@@ -372,43 +370,20 @@ async def scrape_url(url: str, client: httpx.AsyncClient) -> ScrapedResult | Err
 # Batch scraper
 # ---------------------------------------------------------------------------
 
-async def scrape_url_llm(url: str) -> ScrapedResult | ErrorResult:
-    """Run extraction via LLM agent in a worker thread."""
-    try:
-        data = await asyncio.to_thread(run_extraction, url)
-        return ScrapedResult(
-            url=url,
-            vendor=data.get("Vendor", ""),
-            product=data.get("Product", ""),
-            edition=data.get("Edition", ""),
-            version=data.get("Version", ""),
-            licence_metric=data.get("LicenseMetric", ""),
-            eos=data.get("EOS", "N/A"),
-            eol=data.get("EOL", "N/A"),
-            status="success",
-        )
-    except Exception as e:
-        error_msg = str(e)
-        if error_msg.startswith("[agent] "):
-            error_msg = error_msg[len("[agent] "):]
-        elif error_msg.startswith("[ERROR] "):
-            error_msg = error_msg[len("[ERROR] "):]
-        return ErrorResult(url=url, error=error_msg)
-
-
 async def scrape_all(urls: list[str]) -> tuple[list[ScrapedResult], list[ErrorResult]]:
     """
-    Scrape all URLs concurrently using the Groq LLM agent.
-    Limits concurrency to 5 to avoid API rate limits.
+    Scrape all URLs concurrently using pure Python (BeautifulSoup).
+    Limits concurrency to MAX_CONCURRENT to avoid overloading servers.
     """
-    semaphore = asyncio.Semaphore(5)
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-    async def bounded_scrape(url: str):
+    async def bounded_scrape(url: str, client: httpx.AsyncClient):
         async with semaphore:
-            return await scrape_url_llm(url)
+            return await scrape_url(url, client)
 
-    tasks = [bounded_scrape(url.strip()) for url in urls if url.strip()]
-    raw = await asyncio.gather(*tasks, return_exceptions=True)
+    async with httpx.AsyncClient(verify=False) as client:
+        tasks = [bounded_scrape(url.strip(), client) for url in urls if url.strip()]
+        raw = await asyncio.gather(*tasks, return_exceptions=True)
 
     results: list[ScrapedResult] = []
     errors: list[ErrorResult] = []

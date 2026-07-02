@@ -41,16 +41,16 @@ def _find_url_columns(df: pd.DataFrame) -> list[str]:
     url_columns = []
     for col in df.columns:
         sample = df[col].dropna().head(10)
-        url_count = sum(1 for v in sample if _looks_like_url(str(v)))
+        url_count = sum(1 for v in sample if URL_PATTERN.search(str(v)))
         if url_count > 0:
             url_columns.append(col)
-    # Prefer columns named 'url', 'link', 'href', etc.
+    # Prefer columns named 'url', 'link', 'href', 'licensemetric', etc.
     priority = [c for c in url_columns
-                if any(kw in str(c).lower() for kw in ("url", "link", "href", "address", "site"))]
+                if any(kw in str(c).lower() for kw in ("url", "link", "href", "address", "site", "license", "metric"))]
     return priority or url_columns
 
 
-def parse_uploaded_file(filename: str, content: bytes) -> tuple[list[str], str | None]:
+def parse_uploaded_file(filename: str, content: bytes) -> tuple[list[str], Union[str, None]]:
     """
     Parse an uploaded file and return (list_of_urls, error_message).
     Supports .txt, .csv, .xlsx, .xls files.
@@ -83,8 +83,7 @@ def parse_uploaded_file(filename: str, content: bytes) -> tuple[list[str], str |
             for col in url_cols:
                 for val in df[col].dropna():
                     v = str(val).strip()
-                    if _looks_like_url(v):
-                        urls.append(v)
+                    urls.extend(URL_PATTERN.findall(v))
             return list(dict.fromkeys(urls)), None  # deduplicate preserving order
 
         elif filename_lower.endswith((".xlsx", ".xls")):
@@ -99,8 +98,7 @@ def parse_uploaded_file(filename: str, content: bytes) -> tuple[list[str], str |
             for col in url_cols:
                 for val in df[col].dropna():
                     v = str(val).strip()
-                    if _looks_like_url(v):
-                        urls.append(v)
+                    urls.extend(URL_PATTERN.findall(v))
             return list(dict.fromkeys(urls)), None
 
         else:

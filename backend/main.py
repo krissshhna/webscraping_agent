@@ -278,11 +278,26 @@ class BulkScrapeRequest(BaseModel):
     url_column: str
 
 
+def _find_col(df_columns, hints: list):
+    """Find the first df column matching any hint (case-insensitive substring)."""
+    cols_lower = {str(c).lower(): c for c in df_columns}
+    for hint in hints:
+        h = hint.lower()
+        if h in cols_lower:
+            return cols_lower[h]
+    for hint in hints:
+        h = hint.lower()
+        for c_lower, c in cols_lower.items():
+            if h in c_lower or c_lower in h:
+                return c
+    return None
+
+
 @app.post("/api/upload-excel")
 async def upload_excel(file: UploadFile = File(...)):
     """
-    Parse an uploaded Excel/CSV file and return column names + preview rows
-    so the user can pick the URL column.
+    Parse an uploaded Excel/CSV file and return column names + preview rows.
+    Auto-detects the licence metric column that contains URLs.
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
@@ -309,15 +324,25 @@ async def upload_excel(file: UploadFile = File(...)):
     if df.empty:
         raise HTTPException(status_code=422, detail="File contains no data rows")
 
-    # Store the DataFrame in memory with a session ID
+    import re as _re
+    url_col = _find_col(df.columns, ["licensemetric", "licence metric", "license metric", "licencemetric"])
+    if not url_col:
+        url_pat = _re.compile(r"https?://")
+        for c in df.columns:
+            sample = df[c].dropna().astype(str).head(10)
+            if sample.str.contains(url_pat).any():
+                url_col = c
+                break
+
     session_id = str(uuid.uuid4())
     bulk_sessions[session_id] = {
         "df": df,
         "augmented_df": None,
         "filename": file.filename,
+        "auto_url_col": url_col,
+        "orig_col_map": None,
     }
 
-    # Return column names + first 5 rows for preview
     preview = df.head(5).fillna("").to_dict(orient="records")
     return {
         "session_id": session_id,
@@ -325,15 +350,17 @@ async def upload_excel(file: UploadFile = File(...)):
         "columns": list(df.columns),
         "row_count": len(df),
         "preview": preview,
+        "auto_url_col": url_col,
     }
 
 
 @app.post("/api/bulk-scrape")
 async def bulk_scrape(request: BulkScrapeRequest):
     """
-    Scrape URLs from the specified column and append scraped data
-    as new _webscraped columns to the original DataFrame.
+    Extract URLs from the selected column, scrape them, produce an augmented DataFrame.
     """
+    import re as _re
+
     session = bulk_sessions.get(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found. Please re-upload the file.")
@@ -346,92 +373,106 @@ async def bulk_scrape(request: BulkScrapeRequest):
             detail=f"Column '{request.url_column}' not found in uploaded file.",
         )
 
-    # Extract URLs from the selected column
-    raw_urls = df[request.url_column].fillna("").astype(str).tolist()
+    URL_PATTERN = _re.compile(r"https?://[^\s,\"'<>]+")
 
-    # Build a list of (index, url) pairs for rows that have valid URLs
+    new_rows = []
     url_pairs = []
-    for idx, u in enumerate(raw_urls):
-        u = u.strip()
-        if u.startswith("http://") or u.startswith("https://"):
-            url_pairs.append((idx, u))
+
+    for _, row in df.iterrows():
+        u_str = str(row.get(request.url_column) or "")
+        urls = URL_PATTERN.findall(u_str)
+        if urls:
+            for url in urls:
+                url = url.rstrip(".,;)")
+                new_rows.append(row.copy())
+                url_pairs.append((len(new_rows) - 1, url))
+        else:
+            new_rows.append(row.copy())
+
+    expanded_df = pd.DataFrame(new_rows).reset_index(drop=True)
 
     if not url_pairs:
-        raise HTTPException(
-            status_code=400,
-            detail="No valid URLs found in the selected column (must start with http:// or https://).",
-        )
-
+        raise HTTPException(status_code=400, detail="No valid URLs found in the selected column.")
     if len(url_pairs) > 500:
         raise HTTPException(status_code=400, detail="Maximum 500 URLs per batch")
 
-    # Scrape all valid URLs
     urls_to_scrape = [u for _, u in url_pairs]
     results, errors = await scrape_all(urls_to_scrape)
 
-    # Build lookup maps
     result_map = {r.url: r for r in results}
-    error_map = {e.url: e for e in errors}
+    error_map  = {e.url: e for e in errors}
 
-    # Prepare new columns with empty defaults
-    scraped_fields = [
-        "product_webscraped", "vendor_webscraped", "licence_metric_webscraped",
-        "edition_webscraped", "version_webscraped", "eol_webscraped", "eos_webscraped",
+    scraped_cols = [
+        "vendor_webscraped", "product_webscraped", "edition_webscraped",
+        "version_webscraped", "licence_metric_webscraped",
+        "eos_webscraped", "eol_webscraped",
     ]
-    for col in scraped_fields:
-        df[col] = ""
+    for col in scraped_cols:
+        expanded_df[col] = ""
 
-    # Fill in scraped data row by row
     success_count = 0
-    error_count = 0
+    error_count   = 0
+
     for idx, url in url_pairs:
         if url in result_map:
             r = result_map[url]
-            df.at[idx, "product_webscraped"] = r.product
-            df.at[idx, "vendor_webscraped"] = r.vendor
-            df.at[idx, "licence_metric_webscraped"] = r.licence_metric
-            df.at[idx, "edition_webscraped"] = r.edition
-            df.at[idx, "version_webscraped"] = r.version
-            df.at[idx, "eol_webscraped"] = r.eol
-            df.at[idx, "eos_webscraped"] = r.eos
+            expanded_df.at[idx, "vendor_webscraped"]         = r.vendor
+            expanded_df.at[idx, "product_webscraped"]        = r.product
+            expanded_df.at[idx, "edition_webscraped"]        = r.edition
+            expanded_df.at[idx, "version_webscraped"]        = r.version
+            expanded_df.at[idx, "licence_metric_webscraped"] = r.licence_metric
+            expanded_df.at[idx, "eos_webscraped"]            = r.eos
+            expanded_df.at[idx, "eol_webscraped"]            = r.eol
             success_count += 1
         elif url in error_map:
             e = error_map[url]
-            df.at[idx, "product_webscraped"] = f"ERROR: {e.error}"
+            expanded_df.at[idx, "vendor_webscraped"] = f"ERROR: {e.error}"
             error_count += 1
         else:
-            df.at[idx, "product_webscraped"] = "ERROR: No response"
+            expanded_df.at[idx, "vendor_webscraped"] = "ERROR: No response"
             error_count += 1
 
-    # Store augmented DataFrame for download
-    session["augmented_df"] = df
+    orig_col_map = {
+        "url":            _find_col(expanded_df.columns, ["url", "link", "uri"]),
+        "vendor":         _find_col(expanded_df.columns, ["vendor"]),
+        "product":        _find_col(expanded_df.columns, ["product"]),
+        "edition":        _find_col(expanded_df.columns, ["edition"]),
+        "version":        _find_col(expanded_df.columns, ["version"]),
+        "licence_metric": _find_col(expanded_df.columns, ["licensemetric", "licence metric", "license metric"]),
+        "eos":            _find_col(expanded_df.columns, ["eos"]),
+        "eol":            _find_col(expanded_df.columns, ["eol"]),
+    }
 
-    # Return full augmented data for live preview
-    preview_data = df.fillna("").to_dict(orient="records")
+    session["augmented_df"] = expanded_df
+    session["orig_col_map"] = orig_col_map
+
+    preview_data = expanded_df.fillna("").to_dict(orient="records")
     return {
-        "session_id": request.session_id,
-        "total": len(url_pairs),
+        "session_id":    request.session_id,
+        "total":         len(url_pairs),
         "success_count": success_count,
-        "error_count": error_count,
-        "columns": list(df.columns),
-        "rows": preview_data,
-        "row_count": len(df),
+        "error_count":   error_count,
+        "columns":       list(expanded_df.columns),
+        "rows":          preview_data,
+        "row_count":     len(expanded_df),
     }
 
 
 @app.get("/api/bulk-scrape/download/{session_id}")
 async def download_bulk_result(session_id: str):
-    """Download the augmented Excel file with original data + scraped columns."""
+    """Download augmented Excel: 8 original cols + scraped cols with green/red highlights."""
     session = bulk_sessions.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
 
     if session["augmented_df"] is None:
-        raise HTTPException(status_code=400, detail="No scrape results available. Run bulk scrape first.")
+        raise HTTPException(status_code=400, detail="No scrape results. Run bulk scrape first.")
 
-    xlsx_bytes = to_xlsx_augmented(session["augmented_df"])
+    xlsx_bytes = to_xlsx_augmented(
+        session["augmented_df"],
+        orig_col_map=session.get("orig_col_map"),
+    )
 
-    # Build download filename from original
     orig_name = Path(session["filename"]).stem
     download_name = f"{orig_name}_webscraped.xlsx"
 
@@ -453,9 +494,8 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
+        host="localhost",
         port=8000,
         reload=True,
         log_level="info",
     )
-

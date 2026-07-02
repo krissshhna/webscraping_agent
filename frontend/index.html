@@ -1675,7 +1675,7 @@ async function startScrape() {
     if (pct < 30) {
       progressText.textContent = `Fetching and cleaning page content (${urls.length} URL${urls.length > 1 ? 's' : ''})...`;
     } else if (pct < 65) {
-      progressText.textContent = `Structuring product metadata with Groq AI...`;
+      progressText.textContent = `Parsing HTML & extracting product metadata...`;
     } else if (pct < 85) {
       progressText.textContent = `Extracting licensing metrics & references...`;
     } else {
@@ -2030,6 +2030,10 @@ async function handleBulkUpload(file) {
       opt.textContent = col;
       select.appendChild(opt);
     });
+    // Auto-select the detected URL column
+    if (data.auto_url_col) {
+      select.value = data.auto_url_col;
+    }
     document.getElementById('bulk-column-selector-row').classList.add('show');
 
     // Render preview table
@@ -2046,7 +2050,10 @@ async function handleBulkUpload(file) {
     document.getElementById('bulk-results-section').classList.remove('show');
     document.getElementById('bulk-results-section').style.display = 'none';
 
-    showToast('success', `Loaded ${data.filename} — ${data.row_count} rows, ${data.columns.length} columns`);
+    const autoMsg = data.auto_url_col
+      ? ` • Auto-detected URL column: "${data.auto_url_col}"`
+      : ' • Please select the URL column manually';
+    showToast('success', `Loaded ${data.filename} — ${data.row_count} rows${autoMsg}`);
   } catch (err) {
     showToast('error', `Network error: ${err.message}`);
   }
@@ -2121,7 +2128,7 @@ async function startBulkScrape() {
     if (pct < 30) {
       progressText.textContent = 'Fetching and cleaning page content...';
     } else if (pct < 65) {
-      progressText.textContent = 'Structuring product metadata with Groq AI...';
+      progressText.textContent = 'Parsing HTML & extracting product metadata...';
     } else if (pct < 85) {
       progressText.textContent = 'Extracting licensing metrics & references...';
     } else {
